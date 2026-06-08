@@ -1,0 +1,233 @@
+
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.0-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'fraud_detection_secret_key_2026'
+    PYTHONPATH: '/opt/airflow'
+    # App DB connection for DAGs
+    APP_DB_CONN: postgresql://appuser:apppassword@postgres/frauddb
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./data:/data
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - fraud_net
+
+services:
+  # ─────────────────────────────────────────────
+  # KAFKA (KRaft mode, no ZooKeeper needed)
+  # ─────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168     # 7 days — data governance requirement
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - fraud_net
+
+  # ─────────────────────────────────────────────
+  # KAFKA TOPIC SETUP
+  # ─────────────────────────────────────────────
+  kafka-setup:
+    image: apache/kafka:3.8.0
+    container_name: kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        echo 'Creating Kafka topics...' &&
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic transactions --partitions 4 --replication-factor 1 --config retention.ms=604800000 &&
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:9092 --topic fraud-alerts --partitions 2 --replication-factor 1 &&
+        echo 'Topics created successfully.' &&
+        /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server kafka:9092
+    networks:
+      - fraud_net
+
+  # ─────────────────────────────────────────────
+  # POSTGRESQL (App DB + Airflow metadb)
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/create_multiple_dbs.sh:/docker-entrypoint-initdb.d/01_create_dbs.sh
+      - ./db/init.sql:/docker-entrypoint-initdb.d/02_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - fraud_net
+
+  # ─────────────────────────────────────────────
+  # TRANSACTION PRODUCER
+  # ─────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: transactions
+      TRANSACTIONS_PER_SECOND: 2
+      NUM_USERS: 20
+      FRAUD_INJECTION_RATE: 0.05
+    networks:
+      - fraud_net
+
+  # ─────────────────────────────────────────────
+  # SPARK MASTER
+  # ─────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: spark-master
+    hostname: spark-master
+    command: /opt/spark/sbin/start-master.sh
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_NO_DAEMONIZE=true
+    ports:
+      - "8081:8080"   # Spark Web UI
+      - "7077:7077"
+    networks:
+      - fraud_net
+
+  # ─────────────────────────────────────────────
+  # SPARK STREAMING JOB
+  # ─────────────────────────────────────────────
+  spark-streaming:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: transactions
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/frauddb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppassword
+      SPARK_MASTER: "local[*]"
+    volumes:
+      - ./data:/data
+      - ./spark/checkpoints:/tmp/spark-checkpoints
+    ports:
+      - "4040:4040"   # Spark Streaming UI
+    networks:
+      - fraud_net
+
+  # ─────────────────────────────────────────────
+  # AIRFLOW — INIT
+  # ─────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@fraud.local --password admin
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+
+  # ─────────────────────────────────────────────
+  # AIRFLOW — WEBSERVER
+  # ─────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # AIRFLOW — SCHEDULER
+  # ─────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  kafka-data:
+  postgres-data:
+  airflow-logs:
+
+networks:
+  fraud_net:
+    driver: bridge

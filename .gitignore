@@ -1,0 +1,33 @@
+# Data directories (created at runtime)
+data/warehouse/*
+data/reports/*
+!data/warehouse/.gitkeep
+!data/reports/.gitkeep
+
+# Spark checkpoints
+spark/checkpoints/*
+!spark/checkpoints/.gitkeep
+
+# Docker volumes
+postgres-data/
+kafka-data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Airflow
+airflow/logs/
+
+.env
